@@ -292,22 +292,56 @@ fn format_model_switch_report(previous: &str, next: &str, message_count: usize) 
 }
 
 fn format_permissions_report(mode: &str) -> String {
+    let modes = [
+        ("read-only", "Read/search tools only", mode == "read-only"),
+        (
+            "workspace-write",
+            "Edit files inside the workspace",
+            mode == "workspace-write",
+        ),
+        (
+            "danger-full-access",
+            "Unrestricted tool access",
+            mode == "danger-full-access",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, is_current)| {
+        let marker = if is_current {
+            "● current"
+        } else {
+            "○ available"
+        };
+        format!("  {name:<18} {marker:<11} {description}")
+    })
+    .collect::<Vec<_>>()
+    .join(
+        "
+",
+    );
+
     format!(
         "Permissions
-  Current mode     {mode}
+  Active mode      {mode}
+  Mode status      live session default
 
-Available modes
-  read-only        Allow read/search tools only
-  workspace-write  Allow editing within the workspace
-  danger-full-access Allow unrestricted tool access"
+Modes
+{modes}
+
+Usage
+  Inspect current mode with /permissions
+  Switch modes with /permissions <mode>"
     )
 }
 
 fn format_permissions_switch_report(previous: &str, next: &str) -> String {
     format!(
         "Permissions updated
-  Previous         {previous}
-  Current          {next}"
+  Result           mode switched
+  Previous mode    {previous}
+  Active mode      {next}
+  Applies to       subsequent tool calls
+  Usage            /permissions to inspect current mode"
     )
 }
 
@@ -1566,17 +1600,21 @@ mod tests {
     fn permissions_report_uses_sectioned_layout() {
         let report = format_permissions_report("workspace-write");
         assert!(report.contains("Permissions"));
-        assert!(report.contains("Current mode     workspace-write"));
-        assert!(report.contains("Available modes"));
-        assert!(report.contains("danger-full-access"));
+        assert!(report.contains("Active mode      workspace-write"));
+        assert!(report.contains("Modes"));
+        assert!(report.contains("read-only          ○ available Read/search tools only"));
+        assert!(report.contains("workspace-write    ● current   Edit files inside the workspace"));
+        assert!(report.contains("danger-full-access ○ available Unrestricted tool access"));
     }
 
     #[test]
     fn permissions_switch_report_is_structured() {
         let report = format_permissions_switch_report("read-only", "workspace-write");
         assert!(report.contains("Permissions updated"));
-        assert!(report.contains("Previous         read-only"));
-        assert!(report.contains("Current          workspace-write"));
+        assert!(report.contains("Result           mode switched"));
+        assert!(report.contains("Previous mode    read-only"));
+        assert!(report.contains("Active mode      workspace-write"));
+        assert!(report.contains("Applies to       subsequent tool calls"));
     }
 
     #[test]
