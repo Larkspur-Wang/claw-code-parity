@@ -310,6 +310,149 @@ async fn provider_client_dispatches_xai_requests_from_env() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn codex_responses_requests_use_responses_endpoint_and_headers() {
+    let _lock = env_lock();
+    let _wire_api = ScopedEnvVar::set("OPENAI_WIRE_API", "responses");
+    let _account_id = ScopedEnvVar::set("CHATGPT_ACCOUNT_ID", "acct_test");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "event: response.completed\n",
+        "data: {\"response\":{\"id\":\"resp_codex\",\"model\":\"gpt-5.4\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello from Codex\"}]}],\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}}\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[("x-request-id", "req_codex")],
+        )],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&codex_request(false))
+        .await
+        .expect("codex response request should succeed");
+
+    assert_eq!(response.model, "gpt-5.4");
+    assert_eq!(
+        response.content,
+        vec![OutputContentBlock::Text {
+            text: "Hello from Codex".to_string(),
+        }]
+    );
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/responses");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer openai-test-key")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("chatgpt-account-id")
+            .map(String::as_str),
+        Some("acct_test")
+    );
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("gpt-5.4"));
+    assert_eq!(body["reasoning"], json!({"effort": "high"}));
+    assert_eq!(body["input"][0]["type"], json!("message"));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn codex_streaming_translates_responses_sse_events() {
+    let _lock = env_lock();
+    let _wire_api = ScopedEnvVar::set("OPENAI_WIRE_API", "responses");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"in_progress\",\"content\":[],\"role\":\"assistant\"},\"output_index\":0,\"sequence_number\":0}\n\n",
+        "event: response.content_part.added\n",
+        "data: {\"type\":\"response.content_part.added\",\"content_index\":0,\"item_id\":\"msg_1\",\"output_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"},\"sequence_number\":1}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"delta\":\"ok\",\"item_id\":\"msg_1\",\"output_index\":0,\"sequence_number\":2}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}],\"role\":\"assistant\"},\"output_index\":0,\"sequence_number\":3}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1}},\"sequence_number\":4}\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[("x-request-id", "req_codex_stream")],
+        )],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&codex_request(false))
+        .await
+        .expect("codex stream should start");
+
+    assert_eq!(stream.request_id(), Some("req_codex_stream"));
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::Text { .. },
+            ..
+        })
+    ));
+    assert!(matches!(
+        events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { .. },
+            ..
+        })
+    ));
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+    ));
+    assert!(matches!(
+        events[4],
+        StreamEvent::MessageDelta(MessageDeltaEvent { .. })
+    ));
+    assert!(matches!(events[5], StreamEvent::MessageStop(_)));
+
+    match &events[4] {
+        StreamEvent::MessageDelta(MessageDeltaEvent { delta, usage }) => {
+            assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!(usage.input_tokens, 2);
+            assert_eq!(usage.output_tokens, 1);
+        }
+        other => panic!("expected message delta, got {other:?}"),
+    }
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/responses");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["stream"], json!(true));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     path: String,
@@ -441,6 +584,31 @@ fn http_response_with_headers(
 fn sample_request(stream: bool) -> MessageRequest {
     MessageRequest {
         model: "grok-3".to_string(),
+        max_tokens: 64,
+        messages: vec![InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::Text {
+                text: "Say hello".to_string(),
+            }],
+        }],
+        system: Some("Use tools when needed".to_string()),
+        tools: Some(vec![ToolDefinition {
+            name: "weather".to_string(),
+            description: Some("Fetches weather".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+        }]),
+        tool_choice: Some(ToolChoice::Auto),
+        stream,
+    }
+}
+
+fn codex_request(stream: bool) -> MessageRequest {
+    MessageRequest {
+        model: "codexplan".to_string(),
         max_tokens: 64,
         messages: vec![InputMessage {
             role: "user".to_string(),

@@ -5,6 +5,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod codex_responses;
 pub mod openai_compat;
 
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
@@ -64,6 +65,24 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             auth_env: "ANTHROPIC_API_KEY",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_base_url: anthropic::DEFAULT_BASE_URL,
+        },
+    ),
+    (
+        "codexplan",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "CODEX_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: codex_responses::DEFAULT_CODEX_BASE_URL,
+        },
+    ),
+    (
+        "codexspark",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "CODEX_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: codex_responses::DEFAULT_CODEX_BASE_URL,
         },
     ),
     (
@@ -133,7 +152,11 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi => match *alias {
+                    "codexplan" => "gpt-5.4",
+                    "codexspark" => "gpt-5.3-codex-spark",
+                    _ => trimmed,
+                },
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -158,6 +181,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    if canonical.starts_with("gpt-5") || canonical.starts_with("gpt-4") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        });
+    }
     None
 }
 
@@ -166,8 +197,14 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
+    if codex_responses::codex_transport_forced() {
+        return ProviderKind::OpenAi;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
+    }
+    if openai_compat::has_api_key("CODEX_API_KEY") || codex_responses::has_saved_codex_credentials() {
+        return ProviderKind::OpenAi;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;

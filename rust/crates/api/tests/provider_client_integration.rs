@@ -53,6 +53,18 @@ fn read_xai_base_url_prefers_env_override() {
     assert_eq!(read_xai_base_url(), "https://example.xai.test/v1");
 }
 
+#[test]
+fn provider_client_routes_codex_aliases_through_openai_transport() {
+    let _lock = env_lock();
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _codex_api_key = EnvVarGuard::set("CODEX_API_KEY", Some("codex-test-key"));
+    let _wire_api = EnvVarGuard::set("OPENAI_WIRE_API", Some("responses"));
+
+    let client = ProviderClient::from_model("codexplan").expect("codex alias should resolve");
+
+    assert_eq!(client.provider_kind(), ProviderKind::OpenAi);
+}
+
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

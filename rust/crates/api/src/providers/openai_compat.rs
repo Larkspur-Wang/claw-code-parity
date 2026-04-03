@@ -12,6 +12,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
+use super::codex_responses::{self, CodexMessageStream, Transport};
 use super::{Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
@@ -32,6 +33,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const OPENAI_OR_CODEX_ENV_VARS: &[&str] = &["OPENAI_API_KEY", "CODEX_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -92,10 +94,22 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+        let api_key = read_env_non_empty(config.api_key_env)?.or_else(|| {
+            (config.provider_name == "OpenAI")
+                .then(|| read_env_non_empty("CODEX_API_KEY"))
+                .transpose()
+                .ok()
+                .flatten()
+                .flatten()
+        });
+        let Some(api_key) = api_key else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
-                config.credential_env_vars(),
+                if config.provider_name == "OpenAI" {
+                    OPENAI_OR_CODEX_ENV_VARS
+                } else {
+                    config.credential_env_vars()
+                },
             ));
         };
         Ok(Self::new(api_key, config))
@@ -128,10 +142,19 @@ impl OpenAiCompatClient {
             stream: false,
             ..request.clone()
         };
-        let response = self.send_with_retry(&request).await?;
+        let resolved_request = self.resolve_request(&request);
+        let response = self.send_with_retry(&request, &resolved_request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let payload = response.json::<ChatCompletionResponse>().await?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = match resolved_request.transport {
+            Transport::ChatCompletions => {
+                let payload = response.json::<ChatCompletionResponse>().await?;
+                normalize_response(&resolved_request.resolved_model, payload)?
+            }
+            Transport::CodexResponses => {
+                let payload = codex_responses::collect_completed_response(response).await?;
+                codex_responses::normalize_response(&payload, &resolved_request.resolved_model)
+            }
+        };
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
@@ -142,28 +165,39 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
-        Ok(MessageStream {
-            request_id: request_id_from_headers(response.headers()),
-            response,
-            parser: OpenAiSseParser::new(),
-            pending: VecDeque::new(),
-            done: false,
-            state: StreamState::new(request.model.clone()),
+        let request = request.clone().with_streaming();
+        let resolved_request = self.resolve_request(&request);
+        let response = self.send_with_retry(&request, &resolved_request).await?;
+        let request_id = request_id_from_headers(response.headers());
+        Ok(match resolved_request.transport {
+            Transport::ChatCompletions => {
+                MessageStream::ChatCompletions(ChatCompletionMessageStream {
+                    request_id,
+                    response,
+                    parser: OpenAiSseParser::new(),
+                    pending: VecDeque::new(),
+                    done: false,
+                    state: StreamState::new(resolved_request.resolved_model),
+                })
+            }
+            Transport::CodexResponses => MessageStream::CodexResponses(CodexMessageStream::new(
+                response,
+                request_id,
+                resolved_request.resolved_model,
+            )),
         })
     }
 
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
+        resolved_request: &codex_responses::ResolvedRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
 
         let last_error = loop {
             attempts += 1;
-            let retryable_error = match self.send_raw_request(request).await {
+            let retryable_error = match self.send_raw_request(request, resolved_request).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => return Ok(response),
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
@@ -189,16 +223,38 @@ impl OpenAiCompatClient {
     async fn send_raw_request(
         &self,
         request: &MessageRequest,
+        resolved_request: &codex_responses::ResolvedRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
-            .post(&request_url)
-            .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+        match resolved_request.transport {
+            Transport::ChatCompletions => {
+                let request_url = chat_completions_endpoint(&resolved_request.base_url);
+                self.http
+                    .post(&request_url)
+                    .header("content-type", "application/json")
+                    .bearer_auth(&self.api_key)
+                    .json(&build_chat_completion_request(request, self.config()))
+                    .send()
+                    .await
+                    .map_err(ApiError::from)
+            }
+            Transport::CodexResponses => {
+                let credentials = codex_responses::resolve_credentials(&self.api_key)?;
+                let request_url = codex_responses::responses_endpoint(&resolved_request.base_url);
+                let payload = codex_responses::build_request_payload(request, resolved_request);
+                let mut request_builder = self
+                    .http
+                    .post(&request_url)
+                    .header("content-type", "application/json")
+                    .header("originator", "claw-code-parity")
+                    .bearer_auth(credentials.api_key)
+                    .json(&payload);
+                if let Some(account_id) = credentials.account_id {
+                    request_builder =
+                        request_builder.header("chatgpt-account-id", account_id);
+                }
+                request_builder.send().await.map_err(ApiError::from)
+            }
+        }
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -212,6 +268,14 @@ impl OpenAiCompatClient {
             .initial_backoff
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
+    }
+
+    fn resolve_request(&self, request: &MessageRequest) -> codex_responses::ResolvedRequest {
+        codex_responses::resolve_request(
+            &request.model,
+            &self.base_url,
+            self.config.default_base_url,
+        )
     }
 }
 
@@ -234,7 +298,13 @@ impl Provider for OpenAiCompatClient {
 }
 
 #[derive(Debug)]
-pub struct MessageStream {
+pub enum MessageStream {
+    ChatCompletions(ChatCompletionMessageStream),
+    CodexResponses(CodexMessageStream),
+}
+
+#[derive(Debug)]
+pub struct ChatCompletionMessageStream {
     request_id: Option<String>,
     response: reqwest::Response,
     parser: OpenAiSseParser,
@@ -244,6 +314,23 @@ pub struct MessageStream {
 }
 
 impl MessageStream {
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::ChatCompletions(stream) => stream.request_id(),
+            Self::CodexResponses(stream) => stream.request_id(),
+        }
+    }
+
+    pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
+        match self {
+            Self::ChatCompletions(stream) => stream.next_event().await,
+            Self::CodexResponses(stream) => stream.next_event().await,
+        }
+    }
+}
+
+impl ChatCompletionMessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
